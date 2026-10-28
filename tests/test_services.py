@@ -31,11 +31,31 @@ from services.common import (
     ConversionError,
     calculate_output_size,
     create_batch_folder,
+    describe_scale,
     format_bytes,
+    format_clock,
+    format_elapsed,
     parse_percentage,
     reserve_output_path,
 )
-from services.image_processor import available_image_formats, convert_image, convert_images, load_image
+from services.compression_stats import (
+    CompressionStats,
+    format_ratio,
+    format_reduction,
+    format_saved,
+    larger_warning,
+)
+from services.ffmpeg_service import FFmpegUnavailableError
+from services.history import HistoryEntry, SessionHistory
+from services.image_processor import (
+    available_image_formats,
+    convert_image,
+    convert_images,
+    load_image,
+    load_thumbnail,
+    parse_image_quality,
+)
+from services.metadata_service import inspect_image, inspect_video, plan_load
 
 
 def sha256(path: Path) -> str:
@@ -886,6 +906,273 @@ class VideoTests(unittest.TestCase):
         for label in ("FLV", "AVI"):
             with self.subTest(fmt=label), self.assertRaises(ConversionError):
                 self.convert(fmt=label)
+
+
+# ===================================================================== dashboard pass ==
+class CompressionStatsTests(unittest.TestCase):
+    MB = 1024 * 1024
+
+    def test_example_from_spec(self):
+        stats = CompressionStats(int(42.6 * self.MB), int(14.8 * self.MB))
+        self.assertAlmostEqual(stats.reduction_percent, 65.26, places=1)
+        self.assertAlmostEqual(stats.ratio, 2.88, places=2)
+        self.assertEqual(format_ratio(stats), "2.88 : 1")
+        self.assertEqual(format_reduction(stats), "65.3%")
+        self.assertEqual(format_saved(stats), "27.8 MB")
+        self.assertFalse(stats.is_larger)
+        self.assertIsNone(larger_warning(stats))
+
+    def test_ratio_is_not_the_percentage(self):
+        stats = CompressionStats(1000, 500)
+        self.assertEqual((stats.ratio, stats.reduction_percent), (2.0, 50.0))
+
+    def test_larger_result_is_reported_honestly(self):
+        stats = CompressionStats(1000, 1084)
+        self.assertTrue(stats.is_larger)
+        self.assertEqual(stats.saved, -84)
+        self.assertLess(stats.reduction_percent, 0)
+        self.assertEqual(larger_warning(stats), "El archivo resultante es 8.4% más grande que el original.")
+        self.assertTrue(format_saved(stats).startswith("+"))
+
+    def test_degenerate_sizes_do_not_crash(self):
+        self.assertIsNone(CompressionStats(100, 0).ratio)
+        self.assertEqual(format_ratio(CompressionStats(100, 0)), "—")
+        self.assertEqual(CompressionStats(0, 0).reduction_percent, 0.0)
+        self.assertEqual(format_saved(CompressionStats(10, 10)), "0 B")
+
+
+class FormatHelperTests(unittest.TestCase):
+    def test_elapsed_and_clock(self):
+        self.assertEqual(format_elapsed(18.4), "18.4 s")
+        self.assertEqual(format_elapsed(102), "01:42")
+        self.assertEqual(format_elapsed(3725), "01:02:05")
+        self.assertEqual(format_elapsed(None), "—")
+        self.assertEqual(format_clock(18.4), "00:00:18")
+        self.assertEqual(format_clock(3725), "01:02:05")
+
+    def test_describe_scale(self):
+        linear, pixels = describe_scale((1920, 1080), (1280, 720))
+        self.assertAlmostEqual(linear, 66.67, places=1)
+        self.assertAlmostEqual(pixels, 44.44, places=1)
+        self.assertEqual(describe_scale((1920, 1080), (1920, 1080)), (100.0, 100.0))
+
+
+class HistoryTests(unittest.TestCase):
+    def test_newest_first_and_bounded(self):
+        history = SessionHistory(limit=3)
+        for number in range(5):
+            history.add(HistoryEntry(f"f{number}.mp4", "video", 10, 5, Path(f"f{number}.mp4")))
+        self.assertEqual([entry.name for entry in history.entries], ["f4.mp4", "f3.mp4", "f2.mp4"])
+        self.assertEqual(len(history), 3)
+
+    def test_remove_discarded_location(self):
+        history = SessionHistory()
+        history.add(HistoryEntry("a.png", "imagen", 10, 5, Path("outs/a.png")))
+        history.add(HistoryEntry("b.png", "imagen", 10, 5, Path("outs/b.png")))
+        history.remove_location(Path("outs/a.png"))
+        self.assertEqual([entry.name for entry in history.entries], ["b.png"])
+
+
+class ResultFieldsTests(unittest.TestCase):
+    """Los resultados traen tamaños y tiempos medidos sobre los archivos reales."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+        self.out = self.tmp / "outs"
+        self.addCleanup(self._tmp.cleanup)
+
+    def test_image_result_fields(self):
+        source = self.tmp / "foto.png"
+        make_test_image(source, 800, 600)
+        result = convert_image(source, 50, "JPG", self.out)
+        self.assertEqual(result.kind, "imagen")
+        self.assertEqual(result.source_size, (800, 600))
+        self.assertEqual(result.source_bytes, source.stat().st_size)
+        self.assertEqual(result.output_bytes, result.output_path.stat().st_size)
+        self.assertEqual((result.source_format, result.format_label), ("PNG", "JPG"))
+        self.assertGreaterEqual(result.elapsed_seconds, 0)
+        self.assertEqual(result.source_path, source)
+
+    def test_video_result_fields(self):
+        source = self.tmp / "clip.mp4"
+        make_av_video(source)
+        result = video_processor.convert_video(source, "MP4", make_quality("web"), output_dir=self.out)
+        self.assertEqual(result.kind, "video")
+        self.assertEqual(result.output_bytes, result.output_path.stat().st_size)
+        self.assertEqual(result.source_bytes, source.stat().st_size)
+        self.assertGreater(result.elapsed_seconds, 0)
+        self.assertEqual((result.source_video_codec, result.video_codec), ("H.264", "H.264"))
+        self.assertEqual((result.source_audio_codec, result.audio_codec), ("AAC", "AAC"))
+
+    def test_batch_totals_and_elapsed(self):
+        sources = []
+        for number in range(3):
+            path = self.tmp / f"i{number}.png"
+            make_test_image(path, 400 + number * 100, 300)
+            sources.append(path)
+        (self.tmp / "rota.png").write_bytes(b"no es imagen")
+        sources.append(self.tmp / "rota.png")
+        batch = convert_images(sources, 50, "JPG", self.out)
+        self.assertEqual((len(batch.succeeded), len(batch.failed)), (3, 1))
+        self.assertEqual(batch.source_bytes_total, sum(p.stat().st_size for p in sources[:3]))
+        self.assertEqual(batch.output_bytes_total, sum(item.output_path.stat().st_size for item in batch.succeeded))
+        self.assertGreater(batch.elapsed_seconds, 0)
+
+    def test_image_quality_changes_lossy_size_only(self):
+        source = self.tmp / "ruido.png"
+        noise = (np.random.default_rng(7).random((300, 400, 3)) * 255).astype(np.uint8)
+        cv2.imwrite(str(source), noise)
+        low = convert_image(source, 1, "JPG", self.out, image_quality=30).output_bytes
+        high = convert_image(source, 1, "JPG", self.out, image_quality=95).output_bytes
+        self.assertLess(low, high)
+        webp_low = convert_image(source, 1, "WEBP", self.out, image_quality=30).output_bytes
+        webp_high = convert_image(source, 1, "WEBP", self.out, image_quality=95).output_bytes
+        self.assertLess(webp_low, webp_high)
+        png_a = convert_image(source, 1, "PNG", self.out, image_quality=10).output_bytes
+        png_b = convert_image(source, 1, "PNG", self.out).output_bytes
+        self.assertEqual(png_a, png_b)  # PNG es sin pérdida: la calidad no aplica
+
+    def test_invalid_image_quality(self):
+        for value in ("0", "101", "abc", "", "-3", "9.5"):
+            with self.subTest(value=value), self.assertRaises(ConversionError):
+                parse_image_quality(value)
+        self.assertEqual(parse_image_quality(" 80 "), 80)
+
+    def test_thumbnail_is_small_and_keeps_aspect(self):
+        source = self.tmp / "grande.png"
+        make_test_image(source, 4000, 1000)
+        thumbnail = load_thumbnail(source, (400, 250))
+        self.assertLessEqual(thumbnail.width, 400)
+        self.assertLessEqual(thumbnail.height, 250)
+        self.assertAlmostEqual(thumbnail.width / thumbnail.height, 4.0, delta=0.1)
+
+
+class MetadataTests(unittest.TestCase):
+    def setUp(self):
+        ffmpeg_service.reset_ffmpeg_cache()
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+        self.addCleanup(self._tmp.cleanup)
+
+    def rows(self, meta) -> dict[str, str]:
+        return dict(meta.rows())
+
+    def test_image_metadata_only_detected_values(self):
+        opaque, alpha = self.tmp / "a.png", self.tmp / "b.png"
+        make_test_image(opaque, 320, 200)
+        make_test_image(alpha, 320, 200, alpha=True)
+        meta = inspect_image(opaque)
+        rows = self.rows(meta)
+        self.assertEqual((rows["Archivo"], rows["Resolución"], rows["Formato"]), ("a.png", "320 × 200 px", "PNG"))
+        self.assertEqual((rows["Transparencia"], meta.channels), ("No", 3))
+        self.assertEqual(self.rows(inspect_image(alpha))["Transparencia"], "Sí (canal alfa)")
+        self.assertNotIn("FPS", rows)
+        self.assertNotIn("Duración", rows)
+
+    def test_image_format_comes_from_content_not_extension(self):
+        disguised = self.tmp / "foto.png"
+        make_test_image(self.tmp / "real.jpg", 100, 80)
+        disguised.write_bytes((self.tmp / "real.jpg").read_bytes())
+        self.assertEqual(inspect_image(disguised).container, "JPG")
+
+    def test_video_metadata_with_and_without_audio(self):
+        with_audio, silent = self.tmp / "audio.mp4", self.tmp / "mudo.mp4"
+        make_av_video(with_audio, 640, 360, 2, 30, True)
+        make_av_video(silent, 640, 360, 2, 30, False)
+        meta = inspect_video(with_audio)
+        rows = self.rows(meta)
+        self.assertEqual((rows["Códec video"], rows["Audio"], rows["FPS"]), ("H.264", "AAC", "30"))
+        self.assertEqual(rows["Resolución"], "640 × 360 px")
+        self.assertEqual(rows["Contenedor"], "MP4")
+        self.assertEqual(self.rows(inspect_video(silent))["Audio"], "NINGUNO")  # sin audio no es un error
+
+    def test_video_without_ffmpeg_does_not_invent_codecs(self):
+        video = self.tmp / "v.mp4"
+        make_av_video(video, 320, 240, 1, 30, True)
+        with mock.patch.object(video_processor, "probe_media", side_effect=FFmpegUnavailableError("sin ffmpeg")):
+            meta = inspect_video(video)
+        rows = self.rows(meta)
+        for missing in ("Códec video", "Audio"):
+            self.assertNotIn(missing, rows)
+        self.assertEqual(rows["Resolución"], "320 × 240 px")
+
+    def test_unreliable_frame_count_is_hidden(self):
+        video = self.tmp / "v.mp4"
+        make_av_video(video, 320, 240, 2, 30, False)
+        info = video_processor.probe_video(video)
+        wrong = dataclasses.replace(info, frame_count=info.frame_count * 3)
+        with mock.patch("services.metadata_service.probe_video", return_value=wrong):
+            self.assertIsNone(inspect_video(video).frame_count)
+        self.assertEqual(inspect_video(video).frame_count, info.frame_count)
+
+    def test_corrupt_files_raise_friendly_errors(self):
+        broken_image, broken_video = self.tmp / "x.png", self.tmp / "x.mp4"
+        broken_image.write_bytes(b"nada")
+        broken_video.write_bytes(b"nada")
+        for inspector, path in ((inspect_image, broken_image), (inspect_video, broken_video)):
+            with self.subTest(path=path.name), self.assertRaises(ConversionError):
+                inspector(path)
+
+    def test_plan_load_rules(self):
+        files = {name: self.tmp / name for name in ("a.png", "b.JPG", "c.mp4", "d.mov", "e.txt")}
+        for path in files.values():
+            path.write_bytes(b"x")
+        plan = plan_load([files["a.png"], files["b.JPG"]])
+        self.assertEqual((plan.kind, len(plan.files)), ("imagen", 2))
+        plan = plan_load([files["c.mp4"], files["d.mov"]])  # un video a la vez
+        self.assertEqual((plan.kind, plan.files), ("video", [files["c.mp4"]]))
+        self.assertTrue(any("un video a la vez" in warning for warning in plan.warnings))
+        plan = plan_load([files["a.png"], files["e.txt"]])  # lo no compatible se ignora y se avisa
+        self.assertEqual(len(plan.files), 1)
+        self.assertTrue(any("e.txt" in warning for warning in plan.warnings))
+        for bad in ([files["a.png"], files["c.mp4"]], [files["e.txt"]], [self.tmp], []):
+            with self.subTest(bad=[p.name for p in bad]), self.assertRaises(ConversionError):
+                plan_load(bad)
+
+
+class AdvancedVideoSettingsTests(unittest.TestCase):
+    def test_limits_never_upscale_and_keep_aspect(self):
+        quality = make_quality("custom", 0, 21, "slow", "1280", "")
+        self.assertEqual(quality.target_size(1920, 1080), (1280, 720))
+        self.assertEqual(quality.target_size(640, 360), (640, 360))  # nunca amplía
+        both = make_quality("custom", 0, 21, "medium", "1000", "400")
+        width, height = both.target_size(1920, 1080)
+        self.assertLessEqual(width, 1000)
+        self.assertLessEqual(height, 400)
+        self.assertAlmostEqual(width / height, 16 / 9, delta=0.05)  # sin estirar
+        self.assertTrue(width % 2 == 0 and height % 2 == 0)
+        combined = make_quality("custom", 25, 21, "medium", "1000", "")
+        self.assertLessEqual(combined.target_size(1920, 1080)[0], 1000)  # reducción y límite se combinan
+
+    def test_preset_and_dimensions_validated(self):
+        self.assertEqual(make_quality("custom", 0, 20, "slower").preset, "slower")
+        for kwargs in ({"custom_preset": "ultrafast"}, {"max_width": "abc"}, {"max_width": "10"},
+                       {"max_height": "99999"}, {"max_width": "-5"}):
+            with self.subTest(kwargs=kwargs), self.assertRaises(ConversionError):
+                make_quality("custom", 0, 20, **kwargs)
+
+    def test_fixed_profiles_ignore_advanced_values(self):
+        self.assertEqual(make_quality("high", 0, 20, "slower", "320", "240").target_size(1920, 1080), (1920, 1080))
+        self.assertEqual(make_quality("high").preset, "medium")
+
+    def test_custom_preset_reaches_ffmpeg_command(self):
+        info = get_ffmpeg()
+        profile = ffmpeg_service.VIDEO_PROFILES["MP4"]
+        command = ffmpeg_service.build_transcode_command(
+            info, profile, make_quality("custom", 0, 24, "fast"), Path("a.mp4"), Path("o.mp4"), None, True)
+        self.assertEqual(command[command.index("-preset") + 1], "fast")
+        self.assertEqual(command[command.index("-crf") + 1], "24")
+        self.assertNotIn("-vf", command)
+
+    def test_custom_limits_end_to_end(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "v.mp4"
+            make_av_video(source, 1280, 720, 2, 30, True)
+            result = video_processor.convert_video(
+                source, "MP4", make_quality("custom", 0, 26, "veryfast", "640", ""), output_dir=Path(tmp) / "outs")
+            self.assertEqual(result.output_size, (640, 360))
+            self.assertEqual(video_stats(result.output_path)["size"], (640, 360))
 
 
 if __name__ == "__main__":

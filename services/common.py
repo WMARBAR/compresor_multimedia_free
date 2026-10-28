@@ -49,6 +49,14 @@ class ConversionResult:
     has_source_audio: bool | None = None
     quality_label: str | None = None  # p. ej. «Alta (CRF 20)»
     source_bytes: int | None = None
+    # Imágenes y videos (se miden sobre los archivos reales):
+    output_bytes: int | None = None
+    elapsed_seconds: float | None = None
+    source_format: str | None = None  # p. ej. «PNG», «MP4»
+    kind: str | None = None  # «imagen» o «video»
+    source_path: Path | None = None
+    source_video_codec: str | None = None  # códecs del original (video), para «H.264 → H.264»
+    source_audio_codec: str | None = None
 
 
 @dataclass
@@ -61,10 +69,20 @@ class BatchResult:
     failed: list[tuple[Path, str]] = field(default_factory=list)  # (origen, motivo)
     cancelled: bool = False
     used_batch_folder: bool = False
+    elapsed_seconds: float | None = None
 
     @property
     def processed(self) -> int:
         return len(self.succeeded) + len(self.failed)
+
+    @property
+    def source_bytes_total(self) -> int:
+        """Peso original de las imágenes que sí se convirtieron."""
+        return sum(item.source_bytes or 0 for item in self.succeeded)
+
+    @property
+    def output_bytes_total(self) -> int:
+        return sum(item.output_bytes or 0 for item in self.succeeded)
 
 
 def ensure_output_dir(output_dir: Path = OUTPUT_DIR) -> Path:
@@ -194,6 +212,37 @@ def format_bytes(size: int) -> str:
             return f"{value:.0f} {unit}" if unit == "B" else f"{value:.1f} {unit}"
         value /= 1024
     return f"{value:.1f} GB"
+
+
+def describe_scale(source: tuple[int, int], target: tuple[int, int]) -> tuple[float, float]:
+    """``(escala lineal %, píxeles %)`` de la resolución final respecto a la original.
+
+    Escala lineal: 1920×1080 → 1280×720 es 66.7 % (cada lado); píxeles: 44.4 % del total.
+    """
+    source_pixels, target_pixels = source[0] * source[1], target[0] * target[1]
+    if source_pixels <= 0:
+        return 100.0, 100.0
+    pixel_ratio = target_pixels / source_pixels
+    return pixel_ratio**0.5 * 100.0, pixel_ratio * 100.0
+
+
+def format_elapsed(seconds: float | None) -> str:
+    """Tiempo de proceso: ``18.4 s`` por debajo de un minuto y ``01:42`` / ``1:02:05`` a partir de ahí."""
+    if seconds is None or seconds < 0:
+        return "—"
+    if seconds < 60:
+        return f"{seconds:.1f} s"
+    return format_duration(seconds)
+
+
+def format_clock(seconds: float | None) -> str:
+    """Siempre ``HH:MM:SS`` (tarjeta técnica de resultados)."""
+    if seconds is None or seconds < 0:
+        return "—"
+    total = int(round(seconds))
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
 
 
 def format_duration(seconds: float | None) -> str:

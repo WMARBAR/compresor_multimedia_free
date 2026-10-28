@@ -19,6 +19,7 @@ import os
 import shutil
 import tempfile
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -73,6 +74,8 @@ class VideoInfo:
     first_frame: np.ndarray
     has_audio: bool | None  # None si no se pudo comprobar (FFmpeg no disponible)
     container_duration: float | None = None  # duración que informa el contenedor (video + audio)
+    video_codec: str | None = None  # códec de FFmpeg tal como se informa («h264», «hevc»...)
+    audio_codec: str | None = None
 
 
 def _windows_short_path(path: Path) -> str | None:
@@ -132,9 +135,12 @@ def probe_video(path: Path) -> VideoInfo:
         media = probe_media(path)
         has_audio: bool | None = media.has_audio
         container_duration = media.duration_seconds
+        video_codec, audio_codec = media.video_codec, media.audio_codec
     except FFmpegUnavailableError:
-        has_audio, container_duration = None, None
-    return VideoInfo(width, height, fps, frame_count, duration, frame, has_audio, container_duration)
+        has_audio, container_duration, video_codec, audio_codec = None, None, None, None
+    return VideoInfo(
+        width, height, fps, frame_count, duration, frame, has_audio, container_duration, video_codec, audio_codec
+    )
 
 
 def available_video_formats() -> dict[str, str]:
@@ -162,6 +168,7 @@ def convert_video(
     ``progress_callback(etapa, procesados, total)`` se invoca desde el hilo que ejecuta esta
     función (``total`` es ``None`` si el contenedor no informa el número de frames).
     """
+    started = time.monotonic()
     quality = quality or make_quality()
     ffmpeg = get_ffmpeg()
     profile = available_profiles().get(format_label.upper())
@@ -223,11 +230,18 @@ def convert_video(
             frames_processed=output_frames,
             source_size=(info.width, info.height),
             format_label=profile.label,
-            video_codec=_pretty_codec(probe.video_codec),
-            audio_codec=_pretty_codec(probe.audio_codec) if expect_audio else None,
+            video_codec=pretty_codec(probe.video_codec),
+            audio_codec=pretty_codec(probe.audio_codec) if expect_audio else None,
             has_source_audio=expect_audio,
             quality_label=quality.quality_text,
             source_bytes=source.stat().st_size,
+            output_bytes=output_path.stat().st_size,
+            elapsed_seconds=time.monotonic() - started,
+            source_format=source.suffix.lstrip(".").upper() or None,
+            kind="video",
+            source_path=source,
+            source_video_codec=pretty_codec(info.video_codec),
+            source_audio_codec=pretty_codec(info.audio_codec),
         )
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
@@ -235,10 +249,18 @@ def convert_video(
             discard_reserved(output_path)
 
 
-def _pretty_codec(codec: str | None) -> str | None:
+_CODEC_NAMES = {
+    "h264": "H.264", "hevc": "H.265 (HEVC)", "mpeg4": "MPEG-4", "vp9": "VP9", "vp8": "VP8", "av1": "AV1",
+    "aac": "AAC", "mp3": "MP3", "opus": "Opus", "vorbis": "Vorbis", "ac3": "AC-3", "wmv3": "WMV",
+    "mpeg2video": "MPEG-2",
+}
+
+
+def pretty_codec(codec: str | None) -> str | None:
+    """Nombre legible de un códec de FFmpeg (``h264`` → ``H.264``)."""
     if codec is None:
         return None
-    return "H.264" if codec == "h264" else codec.upper()
+    return _CODEC_NAMES.get(codec, codec.upper())
 
 
 def _verify_output(

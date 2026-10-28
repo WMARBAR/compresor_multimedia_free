@@ -25,7 +25,17 @@ CRF_GUIDE = {
     21: "Buena calidad",
     23: "Mayor compresión",
 }
+CRF_SEVERE_FROM = 27  # el rango termina en 28: desde aquí se advierte de pérdida considerable
 CRF_HIGH_WARNING = "Con CRF superior a 23 pueden aumentar los artefactos visibles (bloques, pérdida de detalle)."
+CRF_SEVERE_WARNING = "Esta configuración puede producir una pérdida considerable de calidad."
+STRONG_REDUCTION_FROM = 50.0  # reducción lineal (%) desde la que se avisa
+STRONG_REDUCTION_WARNING = "La resolución se reducirá significativamente."
+
+# Presets de x264 ofrecidos en el modo avanzado (más lento = archivo más pequeño a igual CRF).
+PRESETS = ("veryfast", "fast", "medium", "slow", "slower")
+DEFAULT_PRESET = "medium"
+MIN_DIMENSION = 64
+MAX_DIMENSION = 16384
 COMPRESSION_WARNING = "Puede reducir notablemente la nitidez del video."
 
 WEB_LONG_SIDE = 1280
@@ -86,6 +96,8 @@ class VideoQuality:
     audio_bitrate: str
     reduction_percent: float | None = None   # reducción porcentual de cada lado
     fit_box: tuple[int, int] | None = None   # (lado largo máx., lado corto máx.)
+    max_width: int | None = None             # límite de ancho (nunca amplía, conserva la relación de aspecto)
+    max_height: int | None = None
 
     @property
     def quality_text(self) -> str:
@@ -96,13 +108,27 @@ class VideoQuality:
         if width < 1 or height < 1:
             raise ConversionError("Las dimensiones originales no son válidas.")
         if self.reduction_percent:
-            return calculate_output_size(width, height, self.reduction_percent, even=True)
-        if self.fit_box:
-            long_limit, short_limit = self.fit_box
-            scale = min(1.0, long_limit / max(width, height), short_limit / min(width, height))
-            if scale < 1.0:
-                return _even(int(round(width * scale))), _even(int(round(height * scale)))
-        return _even(width), _even(height)
+            base = calculate_output_size(width, height, self.reduction_percent, even=True)
+        else:
+            base = _even(width), _even(height)
+            if self.fit_box:
+                long_limit, short_limit = self.fit_box
+                scale = min(1.0, long_limit / max(width, height), short_limit / min(width, height))
+                if scale < 1.0:
+                    base = _even(int(round(width * scale))), _even(int(round(height * scale)))
+        return self._apply_limits(base)
+
+    def _apply_limits(self, size: tuple[int, int]) -> tuple[int, int]:
+        """Aplica el ancho/alto máximos del modo avanzado: se reduce todo por igual, sin estirar ni ampliar."""
+        width, height = size
+        scale = min(
+            1.0,
+            self.max_width / width if self.max_width else 1.0,
+            self.max_height / height if self.max_height else 1.0,
+        )
+        if scale < 1.0:
+            return _even(int(round(width * scale))), _even(int(round(height * scale)))
+        return size
 
     def needs_resize(self, width: int, height: int) -> bool:
         return self.target_size(width, height) != (width, height)
@@ -132,7 +158,34 @@ def parse_crf(value: object) -> int:
     return crf
 
 
-def make_quality(key: str = DEFAULT_PROFILE, custom_reduction: object = 0, custom_crf: object = 20) -> VideoQuality:
+def parse_preset(value: object) -> str:
+    preset = str(value).strip().lower()
+    if preset not in PRESETS:
+        raise ConversionError(f"El preset debe ser uno de: {', '.join(PRESETS)}.")
+    return preset
+
+
+def parse_dimension(value: object, label: str) -> int | None:
+    """Ancho o alto máximo opcional del modo avanzado: vacío = sin límite."""
+    cleaned = str(value).strip()
+    if not cleaned:
+        return None
+    if not cleaned.isdigit():
+        raise ConversionError(f"El {label} máximo debe ser un número entero de píxeles (o déjalo vacío).")
+    number = int(cleaned)
+    if not MIN_DIMENSION <= number <= MAX_DIMENSION:
+        raise ConversionError(f"El {label} máximo debe estar entre {MIN_DIMENSION} y {MAX_DIMENSION} píxeles.")
+    return number
+
+
+def make_quality(
+    key: str = DEFAULT_PROFILE,
+    custom_reduction: object = 0,
+    custom_crf: object = 20,
+    custom_preset: object = DEFAULT_PRESET,
+    max_width: object = "",
+    max_height: object = "",
+) -> VideoQuality:
     """Resuelve un perfil (los valores personalizados solo se usan con ``key == "custom"``)."""
     info = PROFILES.get(key)
     if info is None:
@@ -148,5 +201,8 @@ def make_quality(key: str = DEFAULT_PROFILE, custom_reduction: object = 0, custo
     if key == "compression":
         return VideoQuality(**common, crf=23, preset="medium", audio_bitrate="128k",
                             reduction_percent=HIGH_COMPRESSION_REDUCTION)
-    return VideoQuality(**common, crf=parse_crf(custom_crf), preset="medium", audio_bitrate="128k",
-                        reduction_percent=parse_video_reduction(custom_reduction) or None)
+    return VideoQuality(**common, crf=parse_crf(custom_crf), preset=parse_preset(custom_preset),
+                        audio_bitrate="128k",
+                        reduction_percent=parse_video_reduction(custom_reduction) or None,
+                        max_width=parse_dimension(max_width, "ancho"),
+                        max_height=parse_dimension(max_height, "alto"))

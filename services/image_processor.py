@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -44,15 +45,42 @@ class ImageFormat:
     encode_params: tuple[int, ...]
     supports_alpha: bool
     supports_16bit: bool
+    quality_param: int | None = None  # parámetro de OpenCV con la calidad (solo formatos con pérdida)
 
+    @property
+    def lossy(self) -> bool:
+        return self.quality_param is not None
+
+    def params(self, quality: int | None = None) -> list[int]:
+        """Parámetros de ``cv2.imencode``; ``quality`` (1–100) reemplaza la calidad por defecto."""
+        if quality is None or self.quality_param is None:
+            return list(self.encode_params)
+        return [self.quality_param, int(quality)]
+
+
+DEFAULT_IMAGE_QUALITY = 95
+MIN_IMAGE_QUALITY = 1
+MAX_IMAGE_QUALITY = 100
 
 IMAGE_FORMATS: dict[str, ImageFormat] = {
-    "JPG": ImageFormat("JPG", ".jpg", (cv2.IMWRITE_JPEG_QUALITY, 95), False, False),
+    "JPG": ImageFormat("JPG", ".jpg", (cv2.IMWRITE_JPEG_QUALITY, DEFAULT_IMAGE_QUALITY), False, False,
+                       cv2.IMWRITE_JPEG_QUALITY),
     "PNG": ImageFormat("PNG", ".png", (cv2.IMWRITE_PNG_COMPRESSION, 6), True, True),
-    "WEBP": ImageFormat("WEBP", ".webp", (cv2.IMWRITE_WEBP_QUALITY, 95), True, False),
+    "WEBP": ImageFormat("WEBP", ".webp", (cv2.IMWRITE_WEBP_QUALITY, DEFAULT_IMAGE_QUALITY), True, False,
+                        cv2.IMWRITE_WEBP_QUALITY),
     "BMP": ImageFormat("BMP", ".bmp", (), False, False),
     "TIFF": ImageFormat("TIFF", ".tiff", (), True, True),
 }
+
+
+def parse_image_quality(value: object) -> int:
+    """Calidad de JPG/WEBP escrita por el usuario (entero entre 1 y 100)."""
+    text = str(value).strip()
+    if not text.isdigit() or not MIN_IMAGE_QUALITY <= int(text) <= MAX_IMAGE_QUALITY:
+        raise ConversionError(
+            f"La calidad de imagen debe ser un entero entre {MIN_IMAGE_QUALITY} y {MAX_IMAGE_QUALITY}."
+        )
+    return int(text)
 
 
 @lru_cache(maxsize=1)
@@ -171,11 +199,19 @@ def to_rgb_preview(image: np.ndarray) -> np.ndarray:
     return cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
 
+def load_thumbnail(path: Path, max_size: tuple[int, int]) -> Image.Image:
+    """Miniatura RGB para la interfaz: nunca se muestra la imagen completa en pantalla."""
+    thumbnail = Image.fromarray(to_rgb_preview(load_image(path)))
+    thumbnail.thumbnail(max_size, Image.LANCZOS)  # conserva la relación de aspecto
+    return thumbnail
+
+
 def convert_image(
     source: Path,
     reduction_percent: float,
     format_label: str,
     output_dir: Path = OUTPUT_DIR,
+    image_quality: int | None = None,
 ) -> ConversionResult:
     """Reduce una imagen y la guarda en ``outs/`` como ``<nombre>_convertido.<ext>``.
 
@@ -183,10 +219,13 @@ def convert_image(
     compone sobre fondo blanco. La imagen completa se reescala con
     ``cv2.INTER_AREA`` conservando la relación de aspecto (sin recortes).
     """
+    started = time.monotonic()
     reduction_percent = parse_percentage(reduction_percent)
     fmt = IMAGE_FORMATS.get(format_label.upper())
     if fmt is None or fmt.label not in available_image_formats():
         raise ConversionError(f"El formato de salida «{format_label}» no está disponible en esta instalación.")
+    if image_quality is not None:
+        image_quality = parse_image_quality(image_quality)
 
     image = load_image(source)
     width, height = image_size(image)
@@ -194,7 +233,7 @@ def convert_image(
     try:
         resized = cv2.resize(image, (new_width, new_height), interpolation=cv2.INTER_AREA)
         prepared = _prepare_for_format(resized, fmt)
-        ok, encoded = cv2.imencode(fmt.extension, prepared, list(fmt.encode_params))
+        ok, encoded = cv2.imencode(fmt.extension, prepared, fmt.params(image_quality))
     except cv2.error as exc:
         logger.exception("Fallo al redimensionar/codificar %s", source)
         raise ConversionError("No se pudo procesar la imagen. Puede estar dañada.") from exc
@@ -213,7 +252,19 @@ def convert_image(
         logger.exception("No se pudo escribir %s", output_path)
         raise ConversionError("No se pudo guardar el archivo de salida. Revisa permisos y espacio en disco.") from exc
 
-    return ConversionResult(output_path, (new_width, new_height), warnings)
+    return ConversionResult(
+        output_path,
+        (new_width, new_height),
+        warnings,
+        source_size=(width, height),
+        format_label=fmt.label,
+        source_bytes=source.stat().st_size,
+        output_bytes=output_path.stat().st_size,
+        elapsed_seconds=time.monotonic() - started,
+        source_format=source.suffix.lstrip(".").upper() or None,
+        kind="imagen",
+        source_path=source,
+    )
 
 
 def convert_images(
@@ -223,6 +274,7 @@ def convert_images(
     output_dir: Path = OUTPUT_DIR,
     progress_callback: BatchProgressCallback | None = None,
     cancel_event: threading.Event | None = None,
+    image_quality: int | None = None,
 ) -> BatchResult:
     """Convierte una o varias imágenes con los mismos ajustes.
 
@@ -235,9 +287,12 @@ def convert_images(
     siguiente imagen y se conservan las ya convertidas. Los ajustes inválidos
     sí lanzan ``ConversionError`` (antes de crear nada).
     """
+    started = time.monotonic()
     reduction_percent = parse_percentage(reduction_percent)
     if format_label.upper() not in available_image_formats():
         raise ConversionError(f"El formato de salida «{format_label}» no está disponible en esta instalación.")
+    if image_quality is not None:
+        image_quality = parse_image_quality(image_quality)
     sources = list(sources)
     if not sources:
         raise ConversionError("No hay imágenes para convertir.")
@@ -253,7 +308,9 @@ def convert_images(
             if progress_callback is not None:
                 progress_callback(index, result.total, source.name)
             try:
-                result.succeeded.append(convert_image(source, reduction_percent, format_label, destination))
+                result.succeeded.append(
+                    convert_image(source, reduction_percent, format_label, destination, image_quality)
+                )
             except ConversionError as exc:
                 result.failed.append((source, str(exc)))
             except Exception:  # un fallo inesperado en una imagen no debe detener el lote
@@ -267,4 +324,5 @@ def convert_images(
                 destination.rmdir()
             except OSError:
                 pass
+        result.elapsed_seconds = time.monotonic() - started
     return result
