@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
+import re
+import subprocess
 import sys
 import tempfile
 import threading
 import unittest
+from datetime import datetime
 from pathlib import Path
 from unittest import mock
 
@@ -15,17 +19,23 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from services import ffmpeg_tools, video_processor
+from services import ffmpeg_service, video_processor
+from services.ffmpeg_service import get_ffmpeg
+from services.video_profiles import (
+    CRF_GUIDE, CRF_MAX, CRF_MIN, CRF_WARNING_ABOVE, DEFAULT_PROFILE, PROFILES, make_quality,
+)
 from services.common import (
     OUTPUT_DIR,
     PROJECT_ROOT,
     ConversionCancelled,
     ConversionError,
     calculate_output_size,
+    create_batch_folder,
+    format_bytes,
     parse_percentage,
     reserve_output_path,
 )
-from services.image_processor import available_image_formats, convert_image, load_image
+from services.image_processor import available_image_formats, convert_image, convert_images, load_image
 
 
 def sha256(path: Path) -> str:
@@ -214,6 +224,359 @@ class ImageTests(unittest.TestCase):
         self.assertEqual(list(self.out.iterdir()), [])
 
 
+BATCH_FOLDER_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}(_\d+)?$")
+
+
+class BatchTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+        self.out = self.tmp / "outs"
+        self.src = self.tmp / "src"
+        self.src.mkdir()
+        self.addCleanup(self._tmp.cleanup)
+
+    def make_images(self, count, folder=None, size=(200, 120), prefix="frame", ext=".png"):
+        folder = folder or self.src
+        folder.mkdir(exist_ok=True)
+        paths = []
+        for index in range(1, count + 1):
+            path = folder / f"{prefix}_{index:03d}{ext}"
+            make_test_image(path, size[0] + index, size[1] + index)
+            paths.append(path)
+        return paths
+
+    def snapshot(self, paths):
+        return {p: sha256(p) for p in paths}
+
+    def test_one_image_goes_directly_to_outs_without_folder(self):
+        (source,) = self.make_images(1)
+        result = convert_images([source], 50, "JPG", self.out)
+        self.assertFalse(result.used_batch_folder)
+        self.assertEqual(result.output_dir, self.out)
+        self.assertEqual([p.name for p in self.out.iterdir()], ["frame_001_convertido.jpg"])
+        self.assertEqual(len(result.succeeded), 1)
+
+    def test_two_images_create_timestamp_folder(self):
+        sources = self.make_images(2)
+        before = self.snapshot(sources)
+        result = convert_images(sources, 50, "JPG", self.out)
+        self.assertTrue(result.used_batch_folder)
+        self.assertEqual([p.name for p in self.out.iterdir()], [result.output_dir.name])
+        self.assertRegex(result.output_dir.name, BATCH_FOLDER_PATTERN)
+        self.assertNotIn(":", result.output_dir.name)
+        self.assertEqual(
+            sorted(p.name for p in result.output_dir.iterdir()),
+            ["frame_001_convertido.jpg", "frame_002_convertido.jpg"],
+        )
+        self.assertEqual(self.snapshot(sources), before)
+
+    def test_large_batch_progress_and_independent_sizes(self):
+        sources = self.make_images(24, size=(300, 200))
+        # Resoluciones muy distintas y relaciones de aspecto distintas.
+        mixed = self.src / "mixed"
+        mixed.mkdir()
+        extra = [(mixed / "a.png", (1920, 1080)), (mixed / "b.png", (4000, 3000)), (mixed / "c.png", (500, 1000))]
+        for path, (w, h) in extra:
+            make_test_image(path, w, h)
+        sources += [p for p, _ in extra]
+        before = self.snapshot(sources)
+
+        events = []
+        result = convert_images(sources, 50, "PNG", self.out, lambda done, total, name: events.append((done, total, name)))
+
+        self.assertEqual(len(result.succeeded), 27)
+        self.assertEqual(result.failed, [])
+        # Progreso: una notificación por imagen (antes de procesarla) + una final, siempre creciente.
+        self.assertEqual([e[0] for e in events], list(range(27)) + [27])
+        self.assertTrue(all(total == 27 for _, total, _ in events))
+        self.assertEqual([e[2] for e in events[:-1]], [p.name for p in sources])
+        self.assertIsNone(events[-1][2])
+        # Cada imagen usa su propio tamaño.
+        sizes = {r.output_path.name: r.output_size for r in result.succeeded}
+        self.assertEqual(sizes["a_convertido.png"], (960, 540))
+        self.assertEqual(sizes["b_convertido.png"], (2000, 1500))
+        self.assertEqual(sizes["c_convertido.png"], (250, 500))
+        for r in result.succeeded:
+            decoded = load_image(r.output_path)
+            self.assertEqual((decoded.shape[1], decoded.shape[0]), r.output_size)
+        self.assertEqual(self.snapshot(sources), before)
+
+    def test_every_output_format(self):
+        sources = self.make_images(3)
+        for label, ext in [("JPG", ".jpg"), ("PNG", ".png"), ("WEBP", ".webp"), ("BMP", ".bmp"), ("TIFF", ".tiff")]:
+            with self.subTest(fmt=label):
+                result = convert_images(sources, 25, label, self.out)
+                self.assertEqual(len(result.succeeded), 3)
+                self.assertTrue(all(p.suffix == ext for p in result.output_dir.iterdir()))
+                for r, s in zip(result.succeeded, sources):
+                    original = load_image(s)
+                    self.assertEqual(r.output_size, calculate_output_size(original.shape[1], original.shape[0], 25))
+
+    def test_duplicate_filenames_from_different_directories(self):
+        a, b, c = self.src / "a", self.src / "b", self.src / "c"
+        for folder, color in ((a, 10), (b, 120), (c, 240)):
+            folder.mkdir()
+            make_test_image(folder / "imagen.png", 100 + color, 80)
+        sources = [a / "imagen.png", b / "imagen.png", c / "imagen.png"]
+        before = self.snapshot(sources)
+        result = convert_images(sources, 50, "JPG", self.out)
+        self.assertEqual(
+            sorted(p.name for p in result.output_dir.iterdir()),
+            ["imagen_convertido.jpg", "imagen_convertido_1.jpg", "imagen_convertido_2.jpg"],
+        )
+        # Ninguna salida pisó a otra: cada una conserva el ancho de su origen.
+        widths = sorted(load_image(p).shape[1] for p in result.output_dir.iterdir())
+        self.assertEqual(widths, [55, 110, 170])  # anchos de origen 110, 220 y 340 al 50 %
+        self.assertEqual(self.snapshot(sources), before)
+
+    def test_same_stem_different_extension_does_not_collide(self):
+        make_test_image(self.src / "foto.png", 100, 100)
+        make_test_image(self.src / "foto.bmp", 120, 120)
+        result = convert_images([self.src / "foto.png", self.src / "foto.bmp"], 50, "JPG", self.out)
+        self.assertEqual(sorted(p.name for p in result.output_dir.iterdir()), ["foto_convertido.jpg", "foto_convertido_1.jpg"])
+
+    def test_corrupt_image_does_not_stop_the_batch(self):
+        sources = self.make_images(5)
+        corrupt = sources[2]
+        corrupt.write_bytes(b"esto no es una imagen" * 20)
+        before = self.snapshot(sources)
+        events = []
+        result = convert_images(sources, 50, "PNG", self.out, lambda d, t, n: events.append(n))
+        self.assertEqual(len(result.succeeded), 4)
+        self.assertEqual([p for p, _ in result.failed], [corrupt])
+        self.assertTrue(result.failed[0][1])  # motivo legible, no un traceback
+        self.assertNotIn("Traceback", result.failed[0][1])
+        self.assertEqual(
+            sorted(p.name for p in result.output_dir.iterdir()),
+            ["frame_001_convertido.png", "frame_002_convertido.png",
+             "frame_004_convertido.png", "frame_005_convertido.png"],
+        )
+        self.assertEqual(events[:5], [p.name for p in sources])  # siguió con las demás
+        self.assertEqual(self.snapshot(sources), before)
+
+    def test_all_images_fail_leaves_no_empty_folder(self):
+        sources = self.make_images(3)
+        for path in sources:
+            path.write_bytes(b"x" * 30)
+        result = convert_images(sources, 50, "PNG", self.out)
+        self.assertEqual(len(result.failed), 3)
+        self.assertEqual(list(self.out.iterdir()), [])
+
+    def test_timestamp_folder_format_and_collisions(self):
+        moment = datetime(2026, 10, 28, 8, 49, 32)
+        first = create_batch_folder(self.out, moment)
+        (first / "previo.txt").write_text("no tocar")
+        second = create_batch_folder(self.out, moment)
+        third = create_batch_folder(self.out, moment)
+        self.assertEqual([first.name, second.name, third.name],
+                         ["2026-10-28_08-49-32", "2026-10-28_08-49-32_1", "2026-10-28_08-49-32_2"])
+        self.assertEqual((first / "previo.txt").read_text(), "no tocar")
+        self.assertEqual(list(second.iterdir()), [])
+
+    def test_batch_does_not_overwrite_existing_timestamp_folder(self):
+        sources = self.make_images(2)
+        moment = datetime(2026, 10, 28, 8, 49, 32)
+        existing = self.out / "2026-10-28_08-49-32"
+        existing.mkdir(parents=True)
+        (existing / "frame_001_convertido.png").write_bytes(b"contenido previo")
+        with mock.patch("services.common.datetime") as fake_datetime:
+            fake_datetime.now.return_value = moment
+            result = convert_images(sources, 50, "PNG", self.out)
+        self.assertEqual(result.output_dir.name, "2026-10-28_08-49-32_1")
+        self.assertEqual((existing / "frame_001_convertido.png").read_bytes(), b"contenido previo")
+        self.assertEqual(len(list(result.output_dir.iterdir())), 2)
+
+    def test_cancel_keeps_converted_images(self):
+        sources = self.make_images(6)
+        event = threading.Event()
+        def cancel_when_second_starts(done, total, name):
+            if done == 1:
+                event.set()
+        result = convert_images(sources, 50, "PNG", self.out, cancel_when_second_starts, event)
+        self.assertTrue(result.cancelled)
+        self.assertEqual(len(result.succeeded), 2)  # la 2.ª ya había empezado; la 3.ª no
+        self.assertEqual(len(list(result.output_dir.iterdir())), 2)
+        self.assertTrue(all(r.output_path.exists() for r in result.succeeded))
+
+    def test_cancel_before_first_image_removes_empty_folder(self):
+        sources = self.make_images(3)
+        event = threading.Event()
+        event.set()
+        result = convert_images(sources, 50, "PNG", self.out, cancel_event=event)
+        self.assertTrue(result.cancelled and not result.succeeded)
+        self.assertEqual(list(self.out.iterdir()), [])
+
+    def test_invalid_settings_create_nothing(self):
+        sources = self.make_images(3)
+        for percent, label in ((0, "PNG"), (100, "PNG"), ("abc", "PNG"), (50, "GIF")):
+            with self.subTest(percent=percent, fmt=label), self.assertRaises(ConversionError):
+                convert_images(sources, percent, label, self.out)
+        with self.assertRaises(ConversionError):
+            convert_images([], 50, "PNG", self.out)
+        self.assertFalse(self.out.exists() and any(self.out.iterdir()))
+
+    def test_video_never_uses_a_timestamp_folder(self):
+        video = self.tmp / "clip.mp4"
+        make_test_video(video, frames=5)
+        result = video_processor.convert_video(video, "MP4", output_dir=self.out)
+        self.assertEqual(result.output_path.parent, self.out)
+        self.assertEqual([p.name for p in self.out.iterdir()], ["clip_convertido.mp4"])
+
+
+def make_av_video(path: Path, width=640, height=360, seconds=3, fps=30, audio=True,
+                  vcodec="libx264", acodec="aac", audio_seconds=None) -> None:
+    """Genera un video de prueba con FFmpeg (patrón de colores + tono de 440 Hz si ``audio``)."""
+    command = [str(get_ffmpeg().path), "-y", "-loglevel", "error", "-f", "lavfi",
+               "-i", f"testsrc2=size={width}x{height}:rate={fps}:duration={seconds}"]
+    if audio:
+        command += ["-f", "lavfi", "-i", f"sine=frequency=440:duration={audio_seconds or seconds}"]
+    command += ["-c:v", vcodec, "-pix_fmt", "yuv420p"]
+    if audio:
+        command += ["-c:a", acodec]
+    subprocess.run(command + [str(path)], check=True)
+
+
+def temp_conversion_dirs() -> set[str]:
+    return {p.name for p in Path(tempfile.gettempdir()).glob("conv_video_*")}
+
+
+def video_stats(path: Path) -> dict:
+    capture = cv2.VideoCapture(str(path))
+    try:
+        fps = capture.get(cv2.CAP_PROP_FPS)
+        frames = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
+        return {
+            "size": (int(capture.get(cv2.CAP_PROP_FRAME_WIDTH)), int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))),
+            "fps": fps, "frames": frames, "duration": frames / fps if fps else None,
+            "opens": capture.isOpened() and capture.read()[0],
+        }
+    finally:
+        capture.release()
+
+
+class FFmpegServiceTests(unittest.TestCase):
+    def setUp(self):
+        ffmpeg_service.reset_ffmpeg_cache()
+        self.addCleanup(ffmpeg_service.reset_ffmpeg_cache)
+
+    def test_managed_ffmpeg_is_preferred_and_valid(self):
+        with mock.patch.object(ffmpeg_service.shutil, "which", side_effect=AssertionError("no debe consultar el PATH")):
+            info = ffmpeg_service.get_ffmpeg()
+        self.assertEqual(info.origin, "imageio-ffmpeg")
+        self.assertTrue(info.path.is_file())
+        self.assertTrue({"libx264", "aac"} <= info.encoders)
+        self.assertRegex(info.version, r"^\d")
+        print("\nFFmpeg detectado:", info.version, "|", info.origin, "|", info.path)
+
+    def test_detection_is_cached(self):
+        first = ffmpeg_service.get_ffmpeg()
+        with mock.patch.object(ffmpeg_service, "_candidate_paths", side_effect=AssertionError("redetección")):
+            self.assertIs(ffmpeg_service.get_ffmpeg(), first)
+
+    def test_falls_back_to_system_ffmpeg(self):
+        real = ffmpeg_service.get_ffmpeg().path
+        ffmpeg_service.reset_ffmpeg_cache()
+        with mock.patch.dict(sys.modules, {"imageio_ffmpeg": mock.MagicMock(get_ffmpeg_exe=mock.Mock(side_effect=RuntimeError("sin binario")))}), \
+                mock.patch.object(ffmpeg_service.shutil, "which", return_value=str(real)):
+            info = ffmpeg_service.get_ffmpeg()
+        self.assertEqual(info.origin, "sistema")
+
+    def test_unavailable_gives_clear_error_and_blocks_formats(self):
+        with mock.patch.object(ffmpeg_service, "_candidate_paths", return_value=[]):
+            with self.assertRaises(ffmpeg_service.FFmpegUnavailableError) as ctx:
+                ffmpeg_service.get_ffmpeg()
+            self.assertEqual(str(ctx.exception), ffmpeg_service.FFMPEG_UNAVAILABLE_MESSAGE)
+            self.assertEqual(ffmpeg_service.available_profiles(), {})
+            self.assertEqual(video_processor.available_video_formats(), {})
+            info, message = ffmpeg_service.ffmpeg_status()
+            self.assertIsNone(info)
+            self.assertIn("requiere FFmpeg", message)
+
+    def test_unusable_executable_is_rejected(self):
+        with mock.patch.object(ffmpeg_service, "_candidate_paths", return_value=[("sistema", Path("no_existe_ffmpeg.exe"))]):
+            self.assertIsNone(ffmpeg_service.ffmpeg_status()[0])
+
+    def test_no_shell_true_anywhere(self):
+        for module in (ffmpeg_service, video_processor):
+            self.assertNotIn("shell=True", Path(module.__file__).read_text(encoding="utf-8"))
+
+    def test_probe_parsing(self):
+        stderr = (
+            "Input #0, mov,mp4, from 'x.mp4':\n  Duration: 00:01:02.50, start: 0.000000, bitrate: 900 kb/s\n"
+            "  Stream #0:0[0x1](und): Video: h264 (High) (avc1 / 0x31637661), yuv420p(tv, bt709, progressive), 960x540 [SAR 1:1 DAR 16:9], 30 fps\n"
+            "  Stream #0:1[0x2](und): Audio: aac (LC) (mp4a / 0x6134706D), 44100 Hz, stereo, fltp, 128 kb/s\n"
+        )
+        info = ffmpeg_service.get_ffmpeg()
+        with mock.patch.object(ffmpeg_service, "_run", return_value=mock.Mock(stderr=stderr, returncode=1)):
+            probe = ffmpeg_service.probe_media(Path("x.mp4"), info)
+        self.assertEqual((probe.video_codec, probe.pixel_format, probe.audio_codec), ("h264", "yuv420p", "aac"))
+        self.assertAlmostEqual(probe.duration_seconds, 62.5)
+
+
+class VideoProfileTests(unittest.TestCase):
+    def test_default_profile_keeps_original_resolution(self):
+        self.assertEqual(DEFAULT_PROFILE, "high")
+        quality = make_quality()
+        self.assertEqual((quality.label, quality.crf), ("Alta calidad", 20))
+        self.assertEqual(quality.target_size(1920, 1080), (1920, 1080))
+        self.assertEqual(quality.quality_text, "Alta (CRF 20)")
+
+    def test_profile_settings(self):
+        max_q, high_q, web_q, comp_q = (make_quality(k) for k in ("max", "high", "web", "compression"))
+        self.assertEqual((max_q.crf, max_q.preset), (18, "slow"))
+        self.assertEqual((high_q.crf, high_q.preset), (20, "medium"))
+        self.assertEqual((web_q.crf, web_q.preset), (20, "medium"))
+        self.assertEqual((comp_q.crf, comp_q.preset), (23, "medium"))
+        self.assertEqual(max_q.target_size(1920, 1080), (1920, 1080))
+        self.assertEqual(comp_q.target_size(1920, 1080), (960, 540))
+        self.assertIn("nitidez", PROFILES["compression"].warning)
+
+    def test_web_profile_never_upscales_and_keeps_aspect_ratio(self):
+        web = make_quality("web")
+        for source, expected in [
+            ((1920, 1080), (1280, 720)), ((3840, 2160), (1280, 720)), ((1280, 720), (1280, 720)),
+            ((854, 480), (854, 480)), ((640, 360), (640, 360)), ((2560, 1080), (1280, 540)),
+            ((1080, 1920), (720, 1280)), ((1080, 1080), (720, 720)), ((1366, 768), (1280, 720)),
+        ]:
+            with self.subTest(source=source):
+                self.assertEqual(web.target_size(*source), expected)
+                self.assertLessEqual(expected[0], source[0])
+                self.assertLessEqual(expected[1], source[1])
+
+    def test_target_size_is_always_even_and_never_larger(self):
+        for key in ("max", "high", "web", "compression"):
+            for source in ((1921, 1081), (641, 361), (853, 479), (1920, 1080)):
+                width, height = make_quality(key).target_size(*source)
+                self.assertTrue(width % 2 == 0 and height % 2 == 0, (key, source))
+                self.assertTrue(width <= source[0] and height <= source[1], (key, source))
+
+    def test_custom_profile(self):
+        self.assertEqual(make_quality("custom", 0, 20).target_size(1920, 1080), (1920, 1080))
+        self.assertEqual(make_quality("custom", 25, 21).target_size(1920, 1080), (1440, 810))
+        self.assertEqual(make_quality("custom", "33,5", "23 — Mayor compresión").crf, 23)
+        self.assertEqual(make_quality("custom", 0, "28").crf, 28)
+
+    def test_invalid_custom_values_are_rejected(self):
+        for crf in (16, 29, 0, -5, "abc", "", "nan", "20.5"):
+            with self.subTest(crf=crf), self.assertRaises(ConversionError):
+                make_quality("custom", 0, crf)
+        for reduction in (-1, 100, 150, "abc", "", "nan"):
+            with self.subTest(reduction=reduction), self.assertRaises(ConversionError):
+                make_quality("custom", reduction, 20)
+        with self.assertRaises(ConversionError):
+            make_quality("inexistente")
+
+    def test_crf_guidance_labels(self):
+        self.assertEqual({18: "Muy alta calidad", 20: "Alta calidad", 21: "Buena calidad", 23: "Mayor compresión"}, CRF_GUIDE)
+        self.assertEqual((CRF_MIN, CRF_MAX, CRF_WARNING_ABOVE), (17, 28, 23))
+
+    def test_format_bytes(self):
+        self.assertEqual(format_bytes(512), "512 B")
+        self.assertEqual(format_bytes(3120104), "3.0 MB")
+        self.assertEqual(format_bytes(15_517_000), "14.8 MB")
+
+
 class VideoTests(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -221,70 +584,280 @@ class VideoTests(unittest.TestCase):
         self.out = self.tmp / "outs"
         self.addCleanup(self._tmp.cleanup)
         self.source = self.tmp / "clip.mp4"
-        make_test_video(self.source)
+        make_av_video(self.source)
+        self.ffmpeg = get_ffmpeg()
+        self._temp_before = temp_conversion_dirs()
 
-    def test_probe(self):
+    def convert(self, source=None, quality=None, fmt="MP4", **kwargs):
+        return video_processor.convert_video(source or self.source, fmt, quality, output_dir=self.out, **kwargs)
+
+    def assertNoTempLeftovers(self):
+        self.assertEqual(temp_conversion_dirs() - self._temp_before, set(), "quedaron temporales de la conversión")
+
+    def assertFinalIsWebH264(self, path: Path, audio: bool):
+        probe = ffmpeg_service.probe_media(path, self.ffmpeg)
+        self.assertEqual(probe.video_codec, "h264")  # nunca mpeg4 (MPEG-4 Parte 2)
+        self.assertEqual(probe.pixel_format, "yuv420p")
+        self.assertEqual(probe.audio_codec, "aac" if audio else None)
+        return probe
+
+    # -- metadatos y formatos ------------------------------------------------------------
+    def test_probe_detects_audio_and_no_audio(self):
         info = video_processor.probe_video(self.source)
-        self.assertEqual((info.width, info.height), (320, 240))
-        self.assertAlmostEqual(info.fps, 15.0, places=1)
-        self.assertEqual(info.frame_count, 30)
-        self.assertAlmostEqual(info.duration_seconds, 2.0, places=1)
+        self.assertEqual((info.width, info.height, info.frame_count), (640, 360, 90))
+        self.assertAlmostEqual(info.fps, 30.0, places=1)
+        self.assertTrue(info.has_audio)
+        self.assertAlmostEqual(info.container_duration, 3.0, delta=0.1)
+        silent = self.tmp / "mudo.mp4"
+        make_av_video(silent, audio=False)
+        self.assertFalse(video_processor.probe_video(silent).has_audio)
 
-    def test_formats_only_if_encodable(self):
-        formats = video_processor.available_video_formats()
-        self.assertIn("MP4", formats)
-        print("\nFormatos de video disponibles:", formats, "| códecs:", {e: video_processor._working_fourcc(e) for e in formats.values()})
+    def test_available_formats_are_h264_containers_only(self):
+        self.assertEqual(video_processor.available_video_formats(), {"MP4": ".mp4", "MOV": ".mov"})
 
-    def test_convert_each_format(self):
-        original_hash = sha256(self.source)
-        for label, ext in video_processor.available_video_formats().items():
-            for percent in (25, 50, 75):
-                with self.subTest(fmt=label, percent=percent):
-                    reports = []
-                    result = video_processor.convert_video(
-                        self.source, percent, label, lambda done, total: reports.append((done, total)), None, self.out
-                    )
-                    expected = calculate_output_size(320, 240, percent, even=True)
-                    self.assertEqual(result.output_path.suffix, ext)
-                    capture = cv2.VideoCapture(str(result.output_path))
-                    self.assertEqual((int(capture.get(cv2.CAP_PROP_FRAME_WIDTH)), int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))), expected)
-                    self.assertAlmostEqual(capture.get(cv2.CAP_PROP_FPS), 15.0, places=1)
-                    self.assertEqual(int(capture.get(cv2.CAP_PROP_FRAME_COUNT)), 30)
-                    capture.release()
-                    self.assertEqual(result.frames_processed, 30)
-                    self.assertEqual(reports[-1], (30, 30))
-        self.assertEqual(sha256(self.source), original_hash)
-        leftovers = [p.name for p in self.out.iterdir() if "_convertido" not in p.name]
-        self.assertEqual(leftovers, [])
+    # -- perfiles -------------------------------------------------------------------------
+    def test_default_quality_keeps_1080p_and_everything_else(self):
+        big = self.tmp / "grande.mp4"
+        make_av_video(big, 1920, 1080, seconds=3)
+        before = sha256(big)
+        result = self.convert(big)  # sin perfil: «Alta calidad»
+        self.assertEqual(result.output_path.name, "grande_convertido.mp4")
+        self.assertEqual(result.output_size, (1920, 1080))
+        self.assertEqual(result.source_size, (1920, 1080))
+        self.assertEqual(result.quality_label, "Alta (CRF 20)")
+        self.assertEqual((result.video_codec, result.audio_codec), ("H.264", "AAC"))
+        self.assertTrue(result.has_source_audio and result.audio_preserved)
+        self.assertEqual(result.source_bytes, big.stat().st_size)
+        self.assertFinalIsWebH264(result.output_path, audio=True)
+        stats = video_stats(result.output_path)
+        self.assertTrue(stats["opens"])
+        self.assertEqual(stats["size"], (1920, 1080))
+        self.assertAlmostEqual(stats["fps"], 30.0, places=1)
+        self.assertAlmostEqual(stats["duration"], 3.0, delta=0.2)
+        data = result.output_path.read_bytes()
+        self.assertLess(data.index(b"moov"), data.index(b"mdat"), "faststart: moov debe ir antes de mdat")
+        self.assertEqual(sha256(big), before)
+        self.assertNoTempLeftovers()
+        self.assertEqual([p.name for p in self.out.iterdir()], ["grande_convertido.mp4"])
 
-    def test_odd_dimensions_become_even(self):
-        odd = self.tmp / "odd.mp4"
-        make_test_video(odd, 321, 241, frames=5)
-        # mp4v/H.264 no admiten lados impares en todos los casos: el servicio debe ajustarlos.
-        result = video_processor.convert_video(odd, 50, "MP4", output_dir=self.out)
-        self.assertTrue(result.output_size[0] % 2 == 0 and result.output_size[1] % 2 == 0)
+    def test_each_profile_on_1080p(self):
+        big = self.tmp / "grande.mp4"
+        make_av_video(big, 1920, 1080, seconds=3)
+        for key, expected in (("max", (1920, 1080)), ("high", (1920, 1080)), ("web", (1280, 720)),
+                              ("compression", (960, 540))):
+            with self.subTest(profile=key):
+                result = self.convert(big, make_quality(key))
+                self.assertEqual(result.output_size, expected)
+                self.assertEqual(video_stats(result.output_path)["size"], expected)
+                self.assertTrue(result.quality_label.endswith(f"(CRF {make_quality(key).crf})"))
+                self.assertFinalIsWebH264(result.output_path, audio=True)
 
-    def test_warns_without_ffmpeg(self):
-        with mock.patch.object(video_processor, "find_ffmpeg", return_value=None):
-            result = video_processor.convert_video(self.source, 50, "MP4", output_dir=self.out)
-        self.assertIn(ffmpeg_tools.FFMPEG_MISSING_WARNING, result.warnings)
+    def test_web_profile_does_not_upscale_small_videos(self):
+        for size in ((1280, 720), (854, 480)):
+            with self.subTest(size=size):
+                source = self.tmp / f"v{size[0]}.mp4"
+                make_av_video(source, *size, seconds=1)
+                result = self.convert(source, make_quality("web"))
+                self.assertEqual(result.output_size, size)
+                self.assertEqual(video_stats(result.output_path)["size"], size)
+
+    def test_custom_percentages_and_crf(self):
+        for reduction, expected in ((0, (640, 360)), (25, (480, 270)), (50, (320, 180)), (75, (160, 90))):
+            with self.subTest(reduction=reduction):
+                result = self.convert(quality=make_quality("custom", reduction, 21))
+                self.assertEqual(result.output_size, expected)
+                self.assertEqual(video_stats(result.output_path)["size"], expected)
+                self.assertEqual(result.quality_label, "Personalizado (CRF 21)")
+
+    def test_lower_crf_means_larger_file(self):
+        sizes = {crf: self.convert(quality=make_quality("custom", 0, crf)).output_path.stat().st_size for crf in (18, 23, 28)}
+        self.assertGreater(sizes[18], sizes[23])
+        self.assertGreater(sizes[23], sizes[28])
+
+    def test_transcode_command_lanczos_only_when_resizing(self):
+        info = ffmpeg_service.get_ffmpeg()
+        profile = ffmpeg_service.VIDEO_PROFILES["MP4"]
+        high = make_quality("high")
+        plain = ffmpeg_service.build_transcode_command(info, profile, high, Path("a.mp4"), Path("o.mp4"), None, True)
+        self.assertNotIn("-vf", plain)  # sin reducción no se toca ni un píxel
+        scaled = ffmpeg_service.build_transcode_command(
+            info, profile, make_quality("web"), Path("a.mp4"), Path("o.mp4"), (1280, 720), True)
+        self.assertEqual(scaled[scaled.index("-vf") + 1], "scale=1280:720:flags=lanczos")
+        for command in (plain, scaled):
+            pairs = dict(zip(command, command[1:]))
+            self.assertIsInstance(command, list)
+            self.assertEqual(pairs["-c:v"], "libx264")
+            self.assertEqual(pairs["-c:a"], "aac")
+            self.assertEqual(pairs["-pix_fmt"], "yuv420p")
+            self.assertEqual(pairs["-movflags"], "+faststart")
+            self.assertEqual(pairs["-crf"], "20")
+            self.assertEqual(command.count("-i"), 1)  # una sola entrada: el video original
+            self.assertNotIn("rawvideo", command)
+            self.assertIn("0:a:0", command)
+        silent = ffmpeg_service.build_transcode_command(info, profile, high, Path("a.mp4"), Path("o.mp4"), None, False)
+        self.assertIn("-an", silent)
+        self.assertNotIn("0:a:0", silent)
+        max_cmd = ffmpeg_service.build_transcode_command(info, profile, make_quality("max"), Path("a.mp4"), Path("o.mp4"), None, True)
+        self.assertEqual(dict(zip(max_cmd, max_cmd[1:]))["-preset"], "slow")
+
+    def test_mov_uses_h264_and_aac(self):
+        result = self.convert(fmt="MOV")
+        self.assertEqual(result.output_path.suffix, ".mov")
+        self.assertFinalIsWebH264(result.output_path, audio=True)
+
+    # -- audio ----------------------------------------------------------------------------
+    def test_source_without_audio_is_not_an_error(self):
+        silent = self.tmp / "mudo.mp4"
+        make_av_video(silent, audio=False)
+        result = self.convert(silent)
+        self.assertFalse(result.has_source_audio)
         self.assertFalse(result.audio_preserved)
-        self.assertEqual(video_processor.video_audio_status()[0], ffmpeg_tools.find_ffmpeg() is not None)
+        self.assertIsNone(result.audio_codec)
+        self.assertEqual(result.warnings, [])
+        self.assertFinalIsWebH264(result.output_path, audio=False)
 
-    def test_cancel_cleans_everything(self):
+    def test_audio_longer_or_shorter_than_video_is_preserved_in_sync(self):
+        for name, audio_seconds in (("corto", 1), ("largo", 8)):
+            with self.subTest(audio=name):
+                source = self.tmp / f"audio_{name}.mp4"
+                make_av_video(source, seconds=3, audio_seconds=audio_seconds)
+                result = self.convert(source)
+                self.assertTrue(result.audio_preserved)
+                self.assertAlmostEqual(
+                    ffmpeg_service.probe_media(result.output_path).duration_seconds,
+                    ffmpeg_service.probe_media(source).duration_seconds, delta=0.3)
+
+    # -- entradas -------------------------------------------------------------------------
+    def test_legacy_mpeg4_source_becomes_h264(self):
+        legacy = self.tmp / "viejo.mp4"
+        make_test_video(legacy, 320, 240, frames=20)  # mp4v, sin audio (lo que generaba la versión original)
+        self.assertEqual(ffmpeg_service.probe_media(legacy, self.ffmpeg).video_codec, "mpeg4")
+        result = self.convert(legacy)
+        self.assertEqual(result.output_size, (320, 240))
+        self.assertFinalIsWebH264(result.output_path, audio=False)
+
+    def test_other_input_containers(self):
+        mkv, avi = self.tmp / "a.mkv", self.tmp / "b.avi"
+        make_av_video(mkv, seconds=2)
+        make_av_video(avi, seconds=2, vcodec="mpeg4", acodec="libmp3lame")
+        for source in (mkv, avi):
+            with self.subTest(source=source.name):
+                result = self.convert(source)
+                self.assertTrue(result.audio_preserved)
+                self.assertFinalIsWebH264(result.output_path, audio=True)
+
+    def test_odd_dimensions_become_even_without_distortion(self):
+        odd = self.tmp / "odd.mp4"
+        make_test_video(odd, 321, 241, frames=10)
+        result = self.convert(odd)
+        self.assertEqual(result.output_size, (320, 240))
+        self.assertEqual(video_stats(result.output_path)["size"], (320, 240))
+
+    # -- comportamiento general -----------------------------------------------------------
+    def test_duplicate_output_names(self):
+        names = [self.convert().output_path.name for _ in range(3)]
+        self.assertEqual(names, ["clip_convertido.mp4", "clip_convertido_1.mp4", "clip_convertido_2.mp4"])
+
+    def test_progress_stages_in_order(self):
+        events = []
+        self.convert(progress_callback=lambda s, d, t: events.append((s, d, t)))
+        stages = [e[0] for e in events]
+        self.assertEqual([s for i, s in enumerate(stages) if i == 0 or s != stages[i - 1]],
+                         ["preparing", "encoding", "validating"])
+        encoding = [e for e in events if e[0] == "encoding"]
+        self.assertEqual(encoding[-1], ("encoding", 90, 90))
+        self.assertEqual([e[1] for e in encoding], sorted(e[1] for e in encoding))
+
+    def test_opencv_never_encodes_or_resizes_frames(self):
+        with mock.patch.object(cv2, "VideoWriter", side_effect=AssertionError("VideoWriter no debe usarse")), \
+                mock.patch.object(cv2, "resize", side_effect=AssertionError("cv2.resize no debe usarse")):
+            result = self.convert(quality=make_quality("compression"))
+        self.assertEqual(result.output_size, (320, 180))
+        self.assertFinalIsWebH264(result.output_path, audio=True)
+
+    # -- fallos ---------------------------------------------------------------------------
+    def test_ffmpeg_failure_leaves_nothing_behind(self):
+        broken = dataclasses.replace(ffmpeg_service.VIDEO_PROFILES["MP4"], video_encoder="encoder_que_no_existe")
+        before = sha256(self.source)
+        with mock.patch.object(video_processor, "available_profiles", return_value={"MP4": broken}):
+            with self.assertRaises(ConversionError) as ctx:
+                self.convert()
+        self.assertIn("H.264", str(ctx.exception))
+        self.assertNotIn("Traceback", str(ctx.exception))
+        self.assertEqual(list(self.out.iterdir()), [])
+        self.assertNoTempLeftovers()
+        self.assertEqual(sha256(self.source), before)
+
+    def test_failed_validation_discards_output(self):
+        real_probe = video_processor.probe_media
+
+        def fake_probe(path, ffmpeg=None):
+            if Path(path).name.startswith("final"):  # el archivo generado "resulta" ser MPEG-4 Parte 2
+                return ffmpeg_service.MediaProbe("mpeg4", "yuv420p", "aac", 3.0)
+            return real_probe(path) if ffmpeg is None else real_probe(path, ffmpeg)
+
+        with mock.patch.object(video_processor, "probe_media", side_effect=fake_probe):
+            with self.assertRaises(ConversionError) as ctx:
+                self.convert()
+        self.assertIn("validación", str(ctx.exception))
+        self.assertEqual(list(self.out.iterdir()), [])
+        self.assertNoTempLeftovers()
+
+    def test_missing_audio_in_output_is_a_validation_error(self):
+        real_probe = video_processor.probe_media
+
+        def fake_probe(path, ffmpeg=None):
+            probe = real_probe(path) if ffmpeg is None else real_probe(path, ffmpeg)
+            if Path(path).name.startswith("final"):
+                return ffmpeg_service.MediaProbe(probe.video_codec, probe.pixel_format, None, probe.duration_seconds)
+            return probe
+
+        with mock.patch.object(video_processor, "probe_media", side_effect=fake_probe):
+            with self.assertRaises(ConversionError):
+                self.convert()
+        self.assertEqual(list(self.out.iterdir()), [])
+
+    def test_ffmpeg_unavailable_blocks_conversion_without_silent_fallback(self):
+        ffmpeg_service.reset_ffmpeg_cache()
+        self.addCleanup(ffmpeg_service.reset_ffmpeg_cache)
+        with mock.patch.object(ffmpeg_service, "_candidate_paths", return_value=[]):
+            with self.assertRaises(ffmpeg_service.FFmpegUnavailableError):
+                self.convert()
+        self.assertFalse(self.out.exists() and any(self.out.iterdir()))
+        self.assertNoTempLeftovers()
+
+    def test_cancel_terminates_ffmpeg_and_cleans_up(self):
+        long_source = self.tmp / "larga.mp4"
+        make_av_video(long_source, 1920, 1080, seconds=8)
+        started = []
+        real_popen = subprocess.Popen
+
+        def tracking_popen(*args, **kwargs):
+            process = real_popen(*args, **kwargs)
+            if "-progress" in args[0]:  # solo la conversión (no las consultas de versión/sondeo)
+                started.append(process)
+            return process
+
+        event = threading.Event()
+        before = sha256(long_source)
+        with mock.patch.object(ffmpeg_service.subprocess, "Popen", side_effect=tracking_popen):
+            with self.assertRaises(ConversionCancelled):
+                self.convert(long_source, make_quality("max"),
+                             progress_callback=lambda s, d, t: event.set() if s == "encoding" and d >= 2 else None,
+                             cancel_event=event)
+        self.assertEqual(len(started), 1)
+        self.assertIsNotNone(started[0].poll(), "ffmpeg sigue en ejecución")
+        self.assertEqual(list(self.out.iterdir()), [])
+        self.assertNoTempLeftovers()
+        self.assertEqual(sha256(long_source), before)
+
+    def test_cancel_before_start(self):
         event = threading.Event()
         event.set()
         with self.assertRaises(ConversionCancelled):
-            video_processor.convert_video(self.source, 50, "MP4", cancel_event=event, output_dir=self.out)
-        self.assertEqual(list(self.out.iterdir()), [])
-
-    def test_cancel_mid_conversion(self):
-        event = threading.Event()
-        def stop_after_first(done, total):
-            event.set()
-        with self.assertRaises(ConversionCancelled):
-            video_processor.convert_video(self.source, 50, "MP4", stop_after_first, event, self.out)
-        self.assertEqual(list(self.out.iterdir()), [])
+            self.convert(cancel_event=event)
+        self.assertEqual(list(self.out.iterdir()) if self.out.exists() else [], [])
+        self.assertNoTempLeftovers()
 
     def test_corrupt_and_invalid_videos(self):
         garbage = self.tmp / "roto.mp4"
@@ -295,8 +868,9 @@ class VideoTests(unittest.TestCase):
         truncated.write_bytes(self.source.read_bytes()[:200])
         for path in (garbage, empty, truncated, self.tmp / "no_existe.mp4"):
             with self.subTest(path=path.name), self.assertRaises(ConversionError):
-                video_processor.convert_video(path, 50, "MP4", output_dir=self.out)
+                self.convert(path)
         self.assertEqual(list(self.out.iterdir()) if self.out.exists() else [], [])
+        self.assertNoTempLeftovers()
 
     def test_invalid_fps_rejected(self):
         fake_capture = mock.MagicMock()
@@ -308,60 +882,10 @@ class VideoTests(unittest.TestCase):
                 video_processor.probe_video(self.source)
         self.assertIn("FPS", str(ctx.exception))
 
-    def test_writer_unavailable(self):
-        with mock.patch.object(cv2, "VideoWriter") as writer_cls:
-            writer_cls.return_value.isOpened.return_value = False
-            writer_cls.fourcc = cv2.VideoWriter_fourcc
-            with self.assertRaises(ConversionError):
-                video_processor._resize_frames(
-                    self.source, self.tmp / "x.mp4", "mp4v", video_processor.probe_video(self.source), (160, 120), None, None
-                )
-
-    def test_unknown_format_rejected(self):
-        with self.assertRaises(ConversionError):
-            video_processor.convert_video(self.source, 50, "FLV", output_dir=self.out)
-
-    def test_audio_mux_flow_with_mocked_ffmpeg(self):
-        """Verifica la orquestación del audio con un FFmpeg simulado (no es FFmpeg real)."""
-        calls = []
-
-        def fake_popen(args):
-            calls.append(args)
-            process = mock.MagicMock()
-            process.returncode = 0
-            if "-map" in args:  # mezcla: copia el video reducido como si fuera el resultado con audio
-                Path(args[-1]).write_bytes(Path(args[args.index("-i") + 1]).read_bytes())
-                process.communicate.return_value = ("", "")
-            else:  # inspección del original
-                process.communicate.return_value = ("", "Stream #0:1(und): Audio: aac, 44100 Hz")
-            return process
-
-        with mock.patch.object(video_processor, "find_ffmpeg", return_value=Path("ffmpeg")), \
-                mock.patch.object(ffmpeg_tools, "_popen", side_effect=fake_popen):
-            result = video_processor.convert_video(self.source, 50, "MP4", output_dir=self.out)
-        self.assertTrue(result.audio_preserved)
-        self.assertNotIn(ffmpeg_tools.FFMPEG_MISSING_WARNING, result.warnings)
-        mux_call = next(c for c in calls if "-map" in c)
-        self.assertEqual(mux_call[mux_call.index("-c:a") + 1], "aac")
-        self.assertIn(str(self.source), mux_call)
-
-    def test_audio_mux_failure_falls_back_to_silent(self):
-        def fake_popen(args):
-            process = mock.MagicMock()
-            if "-map" in args:
-                process.returncode = 1
-                process.communicate.return_value = ("", "error simulado")
-            else:
-                process.returncode = 0
-                process.communicate.return_value = ("", "Stream #0:1: Audio: mp3")
-            return process
-
-        with mock.patch.object(video_processor, "find_ffmpeg", return_value=Path("ffmpeg")), \
-                mock.patch.object(ffmpeg_tools, "_popen", side_effect=fake_popen):
-            result = video_processor.convert_video(self.source, 50, "MP4", output_dir=self.out)
-        self.assertFalse(result.audio_preserved)
-        self.assertTrue(result.output_path.stat().st_size > 0)
-        self.assertTrue(any("audio" in w.lower() for w in result.warnings))
+    def test_unknown_or_unsupported_format_rejected(self):
+        for label in ("FLV", "AVI"):
+            with self.subTest(fmt=label), self.assertRaises(ConversionError):
+                self.convert(fmt=label)
 
 
 if __name__ == "__main__":

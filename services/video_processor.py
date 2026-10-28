@@ -1,4 +1,15 @@
-"""Lectura, reducción y conversión de video con OpenCV (+ FFmpeg para el audio)."""
+"""Conversión de video: FFmpeg hace todo el trabajo; OpenCV solo lee metadatos y valida el resultado.
+
+Flujo (una sola codificación, sin generaciones intermedias):
+
+    video original ──► FFmpeg ──► [reescalado Lanczos opcional] ──► H.264 (CRF) + AAC, yuv420p, faststart
+         (video + audio)                                                  │
+                                                         validación del archivo final ──► outs/
+
+OpenCV se usa únicamente para abrir el video (vista previa, resolución, FPS, frames) y para
+comprobar que el archivo generado se abre y tiene las dimensiones esperadas. No se procesan
+frames con OpenCV ni se genera ningún video intermedio (tampoco con ``cv2.VideoWriter``).
+"""
 
 from __future__ import annotations
 
@@ -8,9 +19,7 @@ import os
 import shutil
 import tempfile
 import threading
-import time
 from dataclasses import dataclass
-from functools import lru_cache
 from pathlib import Path
 from typing import Callable
 
@@ -22,29 +31,34 @@ from .common import (
     ConversionCancelled,
     ConversionError,
     ConversionResult,
-    calculate_output_size,
     discard_reserved,
-    parse_percentage,
     reserve_output_path,
 )
-from .ffmpeg_tools import FFMPEG_MISSING_WARNING, find_ffmpeg, has_audio_stream, mux_original_audio
+from .ffmpeg_service import (
+    ContainerProfile,
+    FFmpegInfo,
+    FFmpegTranscoder,
+    FFmpegUnavailableError,
+    MediaProbe,
+    available_profiles,
+    build_transcode_command,
+    get_ffmpeg,
+    probe_media,
+)
+from .video_profiles import VideoQuality, make_quality
 
 logger = logging.getLogger(__name__)
 
 VIDEO_INPUT_EXTENSIONS = (".mp4", ".avi", ".mov", ".mkv", ".m4v", ".webm", ".mpg", ".mpeg", ".wmv")
 
-# Códecs FourCC candidatos por contenedor, en orden de preferencia. Solo se
-# ofrece un formato si OpenCV logra escribir y releer un video de prueba.
-VIDEO_CODEC_CANDIDATES: dict[str, tuple[str, ...]] = {
-    ".mp4": ("mp4v", "avc1"),
-    ".avi": ("XVID", "MJPG"),
-    ".mov": ("mp4v", "avc1"),
-}
-
 _MAX_PLAUSIBLE_FPS = 1000.0
-_PROGRESS_INTERVAL_SECONDS = 0.1
 
-ProgressCallback = Callable[[int, "int | None"], None]
+STAGE_PREPARING = "preparing"
+STAGE_ENCODING = "encoding"
+STAGE_VALIDATING = "validating"
+
+# progress_callback(etapa, frames_procesados, total_de_frames | None)
+ProgressCallback = Callable[[str, int, "int | None"], None]
 
 
 @dataclass(frozen=True)
@@ -55,8 +69,10 @@ class VideoInfo:
     height: int
     fps: float
     frame_count: int | None  # None si el contenedor no lo informa de forma fiable
-    duration_seconds: float | None
+    duration_seconds: float | None  # frames / fps
     first_frame: np.ndarray
+    has_audio: bool | None  # None si no se pudo comprobar (FFmpeg no disponible)
+    container_duration: float | None = None  # duración que informa el contenedor (video + audio)
 
 
 def _windows_short_path(path: Path) -> str | None:
@@ -112,125 +128,106 @@ def probe_video(path: Path) -> VideoInfo:
     frame_count = reported_frames if reported_frames > 0 else None
     duration = frame_count / fps if frame_count else None
     height, width = frame.shape[:2]
-    return VideoInfo(width, height, fps, frame_count, duration, frame)
-
-
-@lru_cache(maxsize=None)
-def _working_fourcc(extension: str) -> str | None:
-    """Primer FourCC con el que OpenCV puede escribir *y releer* un video de prueba."""
-    for fourcc in VIDEO_CODEC_CANDIDATES.get(extension, ()):
-        folder = Path(tempfile.mkdtemp(prefix="conv_codec_"))
-        test_file = folder / f"test{extension}"
-        writer = None
-        try:
-            writer = cv2.VideoWriter(str(test_file), cv2.VideoWriter_fourcc(*fourcc), 25.0, (64, 64))
-            if not writer.isOpened():
-                continue
-            blank = np.zeros((64, 64, 3), dtype=np.uint8)
-            for _ in range(5):
-                writer.write(blank)
-            writer.release()
-            writer = None
-            if test_file.exists() and test_file.stat().st_size > 0:
-                capture = cv2.VideoCapture(str(test_file))
-                try:
-                    if capture.isOpened() and capture.read()[0]:
-                        return fourcc
-                finally:
-                    capture.release()
-        except cv2.error:
-            logger.exception("Prueba de códec %s falló", fourcc)
-        finally:
-            if writer is not None:
-                writer.release()
-            shutil.rmtree(folder, ignore_errors=True)
-    return None
+    try:
+        media = probe_media(path)
+        has_audio: bool | None = media.has_audio
+        container_duration = media.duration_seconds
+    except FFmpegUnavailableError:
+        has_audio, container_duration = None, None
+    return VideoInfo(width, height, fps, frame_count, duration, frame, has_audio, container_duration)
 
 
 def available_video_formats() -> dict[str, str]:
-    """Formatos de video que esta instalación puede producir: ``{"MP4": ".mp4", ...}``."""
-    return {ext.lstrip(".").upper(): ext for ext in VIDEO_CODEC_CANDIDATES if _working_fourcc(ext)}
-
-
-def video_audio_status() -> tuple[bool, str | None]:
-    """``(audio_disponible, aviso)``: si FFmpeg permite conservar el audio original."""
-    if find_ffmpeg() is None:
-        return False, FFMPEG_MISSING_WARNING
-    return True, None
+    """Formatos de video que se pueden producir: ``{"MP4": ".mp4", ...}`` (vacío sin FFmpeg)."""
+    return {label: profile.extension for label, profile in available_profiles().items()}
 
 
 def convert_video(
     source: Path,
-    reduction_percent: float,
     format_label: str,
+    quality: VideoQuality | None = None,
     progress_callback: ProgressCallback | None = None,
     cancel_event: threading.Event | None = None,
     output_dir: Path = OUTPUT_DIR,
 ) -> ConversionResult:
-    """Reduce un video y lo guarda en ``outs/`` como ``<nombre>_convertido.<ext>``.
+    """Convierte un video y lo guarda en ``outs/`` como ``<nombre>_convertido.<ext>``.
 
-    Flujo: OpenCV lee cada frame, lo reescala con ``INTER_AREA`` y lo escribe
-    en un video temporal (mismos FPS que el original). Si FFmpeg está
-    disponible y el original tiene audio, se mezcla ese audio en el resultado
-    final; si no, el resultado queda sin audio y se informa en ``warnings``.
-    Los archivos temporales se eliminan siempre; el original no se toca.
+    ``quality`` define la resolución final y el CRF de H.264 (por defecto «Alta calidad»:
+    resolución original, CRF 20). FFmpeg genera el archivo final en una sola pasada: reescalado
+    Lanczos solo si hay reducción, H.264 (libx264), ``yuv420p``, AAC si el original tiene audio
+    y ``faststart``. Si FFmpeg no está disponible se lanza ``FFmpegUnavailableError`` (nunca se
+    genera un video sin audio por omisión). El archivo se valida antes de entregarse; si algo
+    falla no queda salida parcial.
 
-    ``progress_callback(procesados, total)`` se invoca desde el hilo que
-    ejecuta esta función (``total`` es ``None`` si se desconoce).
+    ``progress_callback(etapa, procesados, total)`` se invoca desde el hilo que ejecuta esta
+    función (``total`` es ``None`` si el contenedor no informa el número de frames).
     """
-    reduction_percent = parse_percentage(reduction_percent)
-    formats = available_video_formats()
-    extension = formats.get(format_label.upper())
-    if extension is None:
-        raise ConversionError(f"El formato de salida «{format_label}» no está disponible en esta instalación.")
-    fourcc_name = _working_fourcc(extension)
+    quality = quality or make_quality()
+    ffmpeg = get_ffmpeg()
+    profile = available_profiles().get(format_label.upper())
+    if profile is None:
+        raise ConversionError(f"El formato de salida «{format_label}» no está disponible.")
 
+    def notify(stage: str, done: int = 0, total: int | None = None) -> None:
+        if progress_callback is not None:
+            progress_callback(stage, done, total)
+
+    notify(STAGE_PREPARING)
     info = probe_video(source)
-    target_width, target_height = calculate_output_size(info.width, info.height, reduction_percent, even=True)
+    expect_audio = bool(info.has_audio)
+    target_size = quality.target_size(info.width, info.height)
+    resize_to = target_size if target_size != (info.width, info.height) else None
+    if cancel_event is not None and cancel_event.is_set():
+        raise ConversionCancelled()
 
-    warnings: list[str] = []
-    ffmpeg = find_ffmpeg()
-    if ffmpeg is None:
-        warnings.append(FFMPEG_MISSING_WARNING)
-
-    output_path = reserve_output_path(source, extension, output_dir)
+    output_path = reserve_output_path(source, profile.extension, output_dir)
     temp_dir = Path(tempfile.mkdtemp(prefix="conv_video_"))
     completed = False
     try:
-        resized_video = temp_dir / f"resized{extension}"
-        frames_processed = _resize_frames(
-            source, resized_video, fourcc_name, info, (target_width, target_height),
-            progress_callback, cancel_event,
-        )
-        if info.frame_count and frames_processed < info.frame_count * 0.95:
-            warnings.append(
-                f"Solo se pudieron leer {frames_processed} de {info.frame_count} frames; "
-                "el video original podría tener partes dañadas."
-            )
+        temp_output = temp_dir / f"final{profile.extension}"
+        command = build_transcode_command(ffmpeg, profile, quality, source, temp_output, resize_to, expect_audio)
+        total_frames = info.frame_count
 
-        final_video, audio_preserved = resized_video, False
-        if ffmpeg is not None:
-            if has_audio_stream(ffmpeg, source):
-                muxed_video = temp_dir / f"muxed{extension}"
-                if mux_original_audio(ffmpeg, resized_video, source, muxed_video, cancel_event):
-                    final_video, audio_preserved = muxed_video, True
-                else:
-                    warnings.append("No se pudo copiar el audio original; el video se generó sin audio.")
+        def on_progress(frames: int, seconds: float | None) -> None:
+            if total_frames is None and seconds is not None and info.container_duration:
+                notify(STAGE_ENCODING, int(seconds * info.fps), int(info.container_duration * info.fps))
             else:
-                warnings.append("El video original no tiene pista de audio.")
+                notify(STAGE_ENCODING, frames, total_frames)
+
+        notify(STAGE_ENCODING, 0, total_frames)
+        with FFmpegTranscoder(command, temp_dir / "ffmpeg.log") as transcoder:
+            transcoder.run(on_progress, cancel_event)
+        notify(STAGE_ENCODING, total_frames or transcoder.frames, total_frames or transcoder.frames)
+
+        notify(STAGE_VALIDATING)
+        probe, output_frames = _verify_output(temp_output, ffmpeg, profile, info, target_size, expect_audio)
 
         if cancel_event is not None and cancel_event.is_set():
             raise ConversionCancelled()
         try:
-            shutil.copyfile(final_video, output_path)
+            shutil.copyfile(temp_output, output_path)
         except OSError as exc:
             logger.exception("No se pudo escribir %s", output_path)
             raise ConversionError(
                 "No se pudo guardar el video de salida. Revisa permisos y espacio en disco."
             ) from exc
+        if output_path.stat().st_size != temp_output.stat().st_size:
+            raise ConversionError("El archivo guardado quedó incompleto. Revisa el espacio en disco.")
+
         completed = True
         return ConversionResult(
-            output_path, (target_width, target_height), warnings, audio_preserved, frames_processed
+            output_path,
+            target_size,
+            [],
+            audio_preserved=expect_audio,
+            frames_processed=output_frames,
+            source_size=(info.width, info.height),
+            format_label=profile.label,
+            video_codec=_pretty_codec(probe.video_codec),
+            audio_codec=_pretty_codec(probe.audio_codec) if expect_audio else None,
+            has_source_audio=expect_audio,
+            quality_label=quality.quality_text,
+            source_bytes=source.stat().st_size,
         )
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
@@ -238,53 +235,63 @@ def convert_video(
             discard_reserved(output_path)
 
 
-def _resize_frames(
-    source: Path,
-    destination: Path,
-    fourcc_name: str,
+def _pretty_codec(codec: str | None) -> str | None:
+    if codec is None:
+        return None
+    return "H.264" if codec == "h264" else codec.upper()
+
+
+def _verify_output(
+    path: Path,
+    ffmpeg: FFmpegInfo,
+    profile: ContainerProfile,
     info: VideoInfo,
-    target_size: tuple[int, int],
-    progress_callback: ProgressCallback | None,
-    cancel_event: threading.Event | None,
-) -> int:
-    """Lee ``source`` frame a frame y escribe la versión reducida en ``destination``."""
-    capture = _open_capture(source)
-    writer: cv2.VideoWriter | None = None
-    processed = 0
-    last_report = 0.0
+    expected_size: tuple[int, int],
+    expect_audio: bool,
+) -> tuple[MediaProbe, int]:
+    """Comprueba el archivo final (lanza ``ConversionError`` si algo no cumple). Devuelve sondeo y frames."""
+    if not path.is_file() or path.stat().st_size == 0:
+        raise ConversionError("FFmpeg no generó el archivo final.")
+
+    problems: list[str] = []
+    frames = 0
+    capture = cv2.VideoCapture(str(path))
     try:
-        writer = cv2.VideoWriter(
-            str(destination), cv2.VideoWriter_fourcc(*fourcc_name), info.fps, target_size
-        )
-        if not writer.isOpened():
-            raise ConversionError(
-                f"No se pudo crear el video de salida: el códec «{fourcc_name}» no está disponible "
-                "en esta instalación de OpenCV."
-            )
-        while True:
-            if cancel_event is not None and cancel_event.is_set():
-                raise ConversionCancelled()
-            ok, frame = capture.read()
-            if not ok or frame is None:
-                break
-            writer.write(cv2.resize(frame, target_size, interpolation=cv2.INTER_AREA))
-            processed += 1
-            now = time.monotonic()
-            if progress_callback is not None and now - last_report >= _PROGRESS_INTERVAL_SECONDS:
-                last_report = now
-                progress_callback(processed, info.frame_count)
-    except cv2.error as exc:
-        logger.exception("Fallo de OpenCV procesando %s", source)
-        raise ConversionError("Ocurrió un error al procesar los frames del video.") from exc
+        if not capture.isOpened() or not capture.read()[0]:
+            problems.append("no se puede abrir con OpenCV")
+        else:
+            size = (int(capture.get(cv2.CAP_PROP_FRAME_WIDTH)), int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT)))
+            if size != expected_size:
+                problems.append(f"resolución {size[0]}×{size[1]} en lugar de {expected_size[0]}×{expected_size[1]}")
+            fps = float(capture.get(cv2.CAP_PROP_FPS))
+            if not math.isfinite(fps) or fps <= 0 or abs(fps - info.fps) > max(0.05 * info.fps, 0.5):
+                problems.append(f"FPS {fps:g} en lugar de {info.fps:g}")
+            frames = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+            if info.frame_count and frames and abs(frames - info.frame_count) > max(3, 0.02 * info.frame_count):
+                problems.append(f"{frames} frames en lugar de {info.frame_count}")
     finally:
         capture.release()
-        if writer is not None:
-            writer.release()
 
-    if processed == 0:
-        raise ConversionError("No se pudo leer ningún frame del video.")
-    if not destination.exists() or destination.stat().st_size == 0:
-        raise ConversionError("No se pudo escribir el video temporal. Revisa el espacio en disco.")
-    if progress_callback is not None:
-        progress_callback(processed, info.frame_count or processed)
-    return processed
+    probe = probe_media(path, ffmpeg)
+    if probe.video_codec != profile.expected_video_codec:
+        problems.append(f"códec de video {probe.video_codec} en lugar de {profile.expected_video_codec}")
+    if probe.pixel_format != profile.pixel_format:
+        problems.append(f"formato de píxel {probe.pixel_format} en lugar de {profile.pixel_format}")
+    if expect_audio and probe.audio_codec != profile.expected_audio_codec:
+        problems.append(f"el audio del original no quedó en el archivo (códec {probe.audio_codec})")
+    if not expect_audio and probe.audio_codec is not None:
+        problems.append("el archivo tiene audio aunque el original no lo tenía")
+
+    expected_duration = info.container_duration or info.duration_seconds
+    if probe.duration_seconds is None:
+        problems.append("no se pudo leer la duración")
+    elif expected_duration and abs(probe.duration_seconds - expected_duration) > max(0.5, 0.03 * expected_duration):
+        problems.append(f"duración {probe.duration_seconds:.2f} s en lugar de ~{expected_duration:.2f} s")
+
+    if problems:
+        logger.error("Validación del archivo final falló: %s", "; ".join(problems))
+        raise ConversionError(
+            "El video generado no superó la validación final y no se guardó. Detalle: "
+            + "; ".join(problems) + "."
+        )
+    return probe, frames

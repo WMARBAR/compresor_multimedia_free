@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import logging
+import threading
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
+from typing import Callable, Sequence
 
 import cv2
 import numpy as np
@@ -13,9 +15,11 @@ from PIL import Image
 
 from .common import (
     OUTPUT_DIR,
+    BatchResult,
     ConversionError,
     ConversionResult,
     calculate_output_size,
+    create_batch_folder,
     discard_reserved,
     parse_percentage,
     reserve_output_path,
@@ -26,6 +30,9 @@ logger = logging.getLogger(__name__)
 IMAGE_INPUT_EXTENSIONS = (".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp")
 
 _EXIF_ORIENTATION_TAG = 0x0112
+
+# progress_callback(imágenes_terminadas, total, nombre_de_la_que_empieza | None)
+BatchProgressCallback = Callable[[int, int, "str | None"], None]
 
 
 @dataclass(frozen=True)
@@ -207,3 +214,57 @@ def convert_image(
         raise ConversionError("No se pudo guardar el archivo de salida. Revisa permisos y espacio en disco.") from exc
 
     return ConversionResult(output_path, (new_width, new_height), warnings)
+
+
+def convert_images(
+    sources: Sequence[Path],
+    reduction_percent: float,
+    format_label: str,
+    output_dir: Path = OUTPUT_DIR,
+    progress_callback: BatchProgressCallback | None = None,
+    cancel_event: threading.Event | None = None,
+) -> BatchResult:
+    """Convierte una o varias imágenes con los mismos ajustes.
+
+    - Una sola imagen: se guarda directamente en ``output_dir`` (``outs/``).
+    - Dos o más: se crea ``output_dir/YYYY-MM-DD_HH-MM-SS/`` y todo va dentro.
+
+    El porcentaje se aplica a cada imagen por separado (cada una conserva su
+    propia relación de aspecto). Una imagen dañada se registra en ``failed`` y
+    el lote continúa. Si se activa ``cancel_event`` se detiene antes de la
+    siguiente imagen y se conservan las ya convertidas. Los ajustes inválidos
+    sí lanzan ``ConversionError`` (antes de crear nada).
+    """
+    reduction_percent = parse_percentage(reduction_percent)
+    if format_label.upper() not in available_image_formats():
+        raise ConversionError(f"El formato de salida «{format_label}» no está disponible en esta instalación.")
+    sources = list(sources)
+    if not sources:
+        raise ConversionError("No hay imágenes para convertir.")
+
+    is_batch = len(sources) >= 2
+    destination = create_batch_folder(output_dir) if is_batch else output_dir
+    result = BatchResult(destination, len(sources), used_batch_folder=is_batch)
+    try:
+        for index, source in enumerate(sources):
+            if cancel_event is not None and cancel_event.is_set():
+                result.cancelled = True
+                break
+            if progress_callback is not None:
+                progress_callback(index, result.total, source.name)
+            try:
+                result.succeeded.append(convert_image(source, reduction_percent, format_label, destination))
+            except ConversionError as exc:
+                result.failed.append((source, str(exc)))
+            except Exception:  # un fallo inesperado en una imagen no debe detener el lote
+                logger.exception("Error inesperado convirtiendo %s", source)
+                result.failed.append((source, "Error inesperado al procesar la imagen."))
+        if progress_callback is not None and not result.cancelled:
+            progress_callback(result.total, result.total, None)
+    finally:
+        if is_batch and not any(destination.iterdir()):
+            try:  # no dejamos carpetas vacías (p. ej. cancelado antes de la primera imagen)
+                destination.rmdir()
+            except OSError:
+                pass
+    return result
